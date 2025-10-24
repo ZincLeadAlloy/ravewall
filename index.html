@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1.0" />
+<title>Audio Reactive Rave Wall</title>
+<style>
+    html, body {
+        margin: 0;
+        padding: 0;
+        background: #000;
+        width: 100%;
+        height: 100%;
+        overflow: hidden;
+        font-family: system-ui, sans-serif;
+        color: #0f0;
+    }
+
+    /* Fullscreen canvas for the glow effect */
+    #raveCanvas {
+        position: fixed;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+        display: block;
+        background: #000; /* hard black bg */
+    }
+
+    /* Optional GIF overlay */
+    #gifOverlay {
+        position: fixed;
+        left: 1rem;
+        bottom: 1rem;
+        max-width: 20vw;
+        max-height: 20vh;
+        object-fit: contain;
+        image-rendering: auto;
+        /* hidden by default until it successfully loads */
+        display: none;
+        pointer-events: none;
+    }
+
+    /* Minimal tiny status text (top-left, optional debug/help) */
+    #status {
+        position: fixed;
+        top: 0.5rem;
+        left: 0.5rem;
+        font-size: 0.7rem;
+        color: #0f0;
+        text-shadow: 0 0 8px #0f0;
+        opacity: 0.4;
+        user-select: none;
+        pointer-events: none;
+    }
+</style>
+</head>
+<body>
+
+<canvas id="raveCanvas"></canvas>
+<img id="gifOverlay" src="overlay.gif" alt="overlay gif" />
+
+<div id="status">initializing audio…</div>
+
+<script>
+(function () {
+    const canvas = document.getElementById('raveCanvas');
+    const ctx = canvas.getContext('2d');
+    const statusEl = document.getElementById('status');
+    const gifOverlay = document.getElementById('gifOverlay');
+
+    // Try to show GIF only if it loads successfully
+    gifOverlay.addEventListener('error', () => {
+        gifOverlay.style.display = 'none';
+    });
+    gifOverlay.addEventListener('load', () => {
+        gifOverlay.style.display = 'block';
+    });
+
+    // Resize canvas to fill window
+    function resize() {
+        canvas.width = window.innerWidth;
+        canvas.height = window.innerHeight;
+    }
+    window.addEventListener('resize', resize);
+    resize();
+
+    // --- AUDIO SETUP ---
+    // We'll grab mic input via getUserMedia and feed it into Web Audio API AnalyserNode
+    // We'll use volume (RMS) to decide when to "pulse" a new neon color.
+    let audioContext;
+    let analyser;
+    let dataArray;
+    let ready = false;
+
+    // Visual state
+    let currentColor = randomNeonColor();
+    let pulseCooldown = 0; // frames until we allow another forced color change
+
+    // For smoother brightness reading
+    function getVolume() {
+        // get current time-domain data
+        analyser.getByteTimeDomainData(dataArray);
+        // compute RMS
+        let sumSquares = 0;
+        for (let i = 0; i < dataArray.length; i++) {
+            const v = (dataArray[i] - 128) / 128; // -1 to 1
+            sumSquares += v * v;
+        }
+        const rms = Math.sqrt(sumSquares / dataArray.length);
+        return rms;
+    }
+
+    // Neon-ish random color generator
+    function randomNeonColor() {
+        // pick a bright hue and high saturation/lightness
+        // We'll do HSL and convert to string
+        const hue = Math.floor(Math.random() * 360); // any hue
+        const sat = 100; // max saturation
+        const light = 60 + Math.random() * 20; // 60-80% lightness = neon glow feel
+        return `hsl(${hue} ${sat}% ${light}%)`;
+    }
+
+    // Draw loop
+    function draw() {
+        requestAnimationFrame(draw);
+
+        if (!ready) {
+            // Darken canvas slowly even if not ready
+            fadeFrame();
+            statusEl.textContent = "allow mic to start visualizer…";
+            return;
+        }
+
+        fadeFrame();
+
+        // Measure volume
+        const vol = getVolume(); // ~0.0 (silent) to ~1.0 (crazy loud, clipping)
+        // Scale to something comfy
+        const intensity = Math.min(vol * 4.0, 1.0); // clamp
+
+        // Change color on spikes
+        // If intensity is big and cooldown is over, pick a new neon
+        if (intensity > 0.3 && pulseCooldown <= 0) {
+            currentColor = randomNeonColor();
+            pulseCooldown = 5; // a few frames so it doesn't flicker every sample
+        } else {
+            pulseCooldown -= 1;
+        }
+
+        // Line thickness based on volume (at least 1px)
+        const lineWidth = 1 + Math.floor(intensity * 20); // up to ~20+ px
+
+        // We draw the bar at the far right of the canvas.
+        const xStart = canvas.width - lineWidth;
+
+        // Soft glow: Draw a vertical gradient that blends currentColor to transparent leftwards.
+        const grad = ctx.createLinearGradient(xStart, 0, xStart - 100, 0);
+        grad.addColorStop(0, currentColor);
+        grad.addColorStop(1, "rgba(0,0,0,0)");
+
+        ctx.fillStyle = grad;
+        ctx.fillRect(xStart, 0, lineWidth + 100, canvas.height);
+
+        // Status/debug (optional)
+        statusEl.textContent =
+            "vol:" + intensity.toFixed(2) + " | color:" + currentColor;
+    }
+
+    // Instead of clearing fully black every frame (which would erase the trail),
+    // we paint a mostly-transparent black rectangle over everything.
+    // Low alpha = longer trails / ghosting.
+    function fadeFrame() {
+        ctx.fillStyle = "rgba(0,0,0,0.08)"; // tweak this for longer/shorter ghost
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+    }
+
+    // Kick off mic access immediately
+    startAudio();
+
+    async function startAudio() {
+        try {
+            // Ask for live audio from mic / system (on some systems you can choose "stereo mix" etc)
+            const stream = await navigator.mediaDevices.getUserMedia({
+                audio: {
+                    echoCancellation: false,
+                    noiseSuppression: false,
+                    autoGainControl: false
+                },
+                video: false
+            });
+
+            audioContext = new (window.AudioContext || window.webkitAudioContext)();
+            const source = audioContext.createMediaStreamSource(stream);
+
+            analyser = audioContext.createAnalyser();
+            analyser.fftSize = 2048;
+            const bufferLength = analyser.fftSize;
+            dataArray = new Uint8Array(bufferLength);
+
+            source.connect(analyser);
+
+            ready = true;
+            statusEl.textContent = "listening 🎧";
+        } catch (err) {
+            console.error(err);
+            statusEl.textContent = "mic access denied or unavailable";
+        }
+    }
+
+    // Start animation
+    requestAnimationFrame(draw);
+
+})();
+</script>
+</body>
+</html>
